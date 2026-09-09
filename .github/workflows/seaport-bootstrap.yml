@@ -1,0 +1,72 @@
+name: seaport-public-bootstrap
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Clone and fingerprint public Seaport deployment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+          git clone --recursive https://github.com/ProjectOpenSea/seaport-1.6.git lab
+          cd lab
+          git checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          {
+            echo "retrieved_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repo=$(git rev-parse HEAD)"
+            echo "forge=$(forge --version | head -1)"
+            echo "cast=$(cast --version | head -1)"
+            git submodule status --recursive
+          } | tee ../results/source-revisions.txt
+          cd ..
+          RPC_URL=""
+          for candidate in https://ethereum-rpc.publicnode.com https://eth.llamarpc.com https://1rpc.io/eth https://rpc.flashbots.net; do
+            if cast block-number --rpc-url "$candidate" >/tmp/block 2>/dev/null; then RPC_URL="$candidate"; break; fi
+          done
+          test -n "$RPC_URL"
+          BLOCK=$(cat /tmp/block)
+          echo "$BLOCK" > results/fork-block.txt
+          SEAPORT=0x0000000000000068F116a894984e2DB1123eB395
+          CONTROLLER=0x00000000F9490004C11Cef243f5400493c00Ad63
+          CONDUIT=0x1e0049783f008a0085193e00003d00cd54003c71
+          for pair in "Seaport:$SEAPORT" "ConduitController:$CONTROLLER" "OpenSeaConduit:$CONDUIT"; do
+            name=${pair%%:*}; addr=${pair#*:}; code=$(cast code "$addr" --block "$BLOCK" --rpc-url "$RPC_URL"); bytes=$(((${#code}-2)/2)); hash=$(cast keccak "$code"); printf '%s address=%s block=%s bytes=%s keccak=%s\n' "$name" "$addr" "$BLOCK" "$bytes" "$hash" | tee -a results/deployment-fingerprint.txt; printf '%s\n' "$code" > "results/${name}.runtime.hex";
+          done
+          {
+            cast call "$SEAPORT" 'information()(string,bytes32,address)' --block "$BLOCK" --rpc-url "$RPC_URL"
+            cast call "$CONTROLLER" 'ownerOf(address)(address)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC_URL"
+            cast call "$CONTROLLER" 'getPotentialOwner(address)(address)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC_URL"
+            cast call "$CONTROLLER" 'getKey(address)(bytes32)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC_URL"
+            cast call "$CONTROLLER" 'getTotalChannels(address)(uint256)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC_URL"
+            cast call "$CONTROLLER" 'getChannels(address)(address[])' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC_URL"
+          } | tee results/control-plane.txt
+          cd lab
+          forge build --profile optimized 2>&1 | tee ../results/forge-build.txt
+          cd ..
+          tar -czf seaport-lab.tar.gz lab results
+      - name: Upload public-source bootstrap
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaport-bootstrap-${{ github.run_id }}
+          path: |
+            results
+            seaport-lab.tar.gz
+          retention-days: 3
