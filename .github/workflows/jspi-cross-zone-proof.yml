@@ -2,8 +2,7 @@ name: JSPI cross-zone execution proof
 
 on:
   push:
-    branches:
-      - security-shell-fetch-20260910
+    branches: [security-shell-fetch-20260910]
 
 permissions:
   actions: read
@@ -16,9 +15,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shell:
-          - current
-          - historical
         include:
           - shell: current
             artifact: current-asan-jsshell
@@ -27,9 +23,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download fetched shell artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: downloaded
@@ -42,23 +36,16 @@ jobs:
         run: |
           set -euxo pipefail
           ARCHIVE=$(find downloaded -type f -name '*.tar.gz' -print -quit)
-          test -n "$ARCHIVE"
           mkdir shell
           tar -xzf "$ARCHIVE" -C shell
           JS=$(find shell -type f -name js -perm -111 -print -quit)
           test -n "$JS"
           echo "JS=$JS" >> "$GITHUB_ENV"
           echo "JS_DIR=$(dirname "$JS")" >> "$GITHUB_ENV"
-
-      - name: Record shell identity
-        shell: bash
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1
-        run: |
-          "$JS" --version 2>&1 | tee shell-version.txt
+          "$JS" --version | tee shell-version.txt
           sha256sum "$JS" | tee shell-sha256.txt
 
-      - name: Execute cross-zone ownership diagnostics
+      - name: Execute ownership proof
         shell: bash
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1:strict_string_checks=1
@@ -67,62 +54,36 @@ jobs:
         run: |
           cat > cross-zone.js <<'EOF'
           "use strict";
+          if (typeof ignoreUnhandledRejections === "function") ignoreUnhandledRejections();
 
-          if (typeof ignoreUnhandledRejections === "function") {
-            ignoreUnhandledRejections();
+          function event(name, data = {}) {
+            print("P1_EVENT " + JSON.stringify(Object.assign({name}, data)));
           }
-
-          function event(name, data) {
-            print("P1_EVENT " + JSON.stringify(Object.assign({name}, data || {})));
-          }
-
-          function fail(message, data) {
-            event("FAIL", Object.assign({message}, data || {}));
+          function fail(message, data = {}) {
+            event("FAIL", Object.assign({message}, data));
             quit(65);
           }
 
-          function errorText(e) {
-            try {
-              return String(e) + (e && e.stack ? "\n" + e.stack : "");
-            } catch (_) {
-              return "<unprintable>";
-            }
-          }
-
-          const api = {
-            suspending: typeof WebAssembly.Suspending,
-            promising: typeof WebAssembly.promising,
-            newGlobal: typeof newGlobal,
-            gc: typeof gc,
-            schedulezone: typeof schedulezone,
-            nukeCCW: typeof nukeCCW,
-            drainJobQueue: typeof drainJobQueue,
-            addMarkObservers: typeof addMarkObservers,
-            getMarks: typeof getMarks,
-            clearKeptObjects: typeof clearKeptObjects,
-            jspiEnabled: typeof wasmJSPromiseIntegrationEnabled === "function"
-              ? wasmJSPromiseIntegrationEnabled()
-              : null,
-            build: typeof getBuildConfiguration === "function"
-              ? getBuildConfiguration()
-              : null,
-          };
-          event("api", api);
-
-          for (const key of ["suspending", "promising", "newGlobal", "gc",
-                             "schedulezone", "nukeCCW", "drainJobQueue",
-                             "addMarkObservers", "getMarks", "clearKeptObjects"]) {
-            if (api[key] !== "function") {
-              event("SKIP", {reason: "missing API", api: key});
+          const required = [
+            "newGlobal", "gc", "schedulezone", "nukeCCW", "drainJobQueue",
+            "addMarkObservers", "getMarks", "clearKeptObjects", "wasmTextToBinary"
+          ];
+          for (const name of required) {
+            if (typeof this[name] !== "function") {
+              event("SKIP", {reason: "missing API", api: name});
               quit(77);
             }
           }
-          if (api.jspiEnabled !== true) {
-            event("SKIP", {reason: "JSPI disabled"});
+          if (typeof WebAssembly.Suspending !== "function" ||
+              typeof WebAssembly.promising !== "function" ||
+              (typeof wasmJSPromiseIntegrationEnabled === "function" &&
+               !wasmJSPromiseIntegrationEnabled())) {
+            event("SKIP", {reason: "JSPI unavailable"});
             quit(77);
           }
+          event("api", {build: getBuildConfiguration()});
 
-          const WAT = `(module
+          const wat = `(module
             (import "m" "wait" (func $wait (result i32)))
             (func (export "run") (param externref) (result i32)
               (local $held externref)
@@ -137,6 +98,7 @@ jobs:
                 i32.const 287454020
               end
               i32.add))`;
+          const encoded = JSON.stringify(Array.from(wasmTextToBinary(wat)));
 
           function setup(label) {
             let source = newGlobal({newCompartment: true});
@@ -151,7 +113,6 @@ jobs:
               });
               function getForeignPromise() { return foreignPromise; }
               function settleForeign(value) { resolveForeign(value); }
-              function rejectIt(value) { rejectForeign(value); }
             `);
 
             source.caseLabel = label;
@@ -164,9 +125,8 @@ jobs:
               var suspending = new WebAssembly.Suspending(function () {
                 return foreignGetPromise();
               });
-              var instance = wasmEvalText(${JSON.stringify(WAT)}, {
-                m: {wait: suspending}
-              });
+              var module = new WebAssembly.Module(new Uint8Array(${encoded}));
+              var instance = new WebAssembly.Instance(module, {m: {wait: suspending}});
               var weakInstance = new WeakRef(instance);
               var promising = WebAssembly.promising(instance.exports.run);
               var outerPromise = promising(liveObject);
@@ -175,9 +135,7 @@ jobs:
                   completionCount++;
                   completion = {kind: "fulfilled", value};
                   print("P1_SOURCE_COMPLETION " + JSON.stringify({
-                    label: caseLabel,
-                    kind: "fulfilled",
-                    value,
+                    label: caseLabel, kind: "fulfilled", value,
                     count: completionCount
                   }));
                 },
@@ -185,24 +143,23 @@ jobs:
                   completionCount++;
                   completion = {kind: "rejected", error: String(error)};
                   print("P1_SOURCE_COMPLETION " + JSON.stringify({
-                    label: caseLabel,
-                    kind: "rejected",
-                    error: String(error),
+                    label: caseLabel, kind: "rejected", error: String(error),
                     count: completionCount
                   }));
                 }
               );
             `);
 
-            // Run PromiseResolve's thenable-assimilation job so the unresolved
-            // foreign-zone Promise is the remaining asynchronous owner.
+            // Complete cross-realm Promise assimilation while the Promise is
+            // still pending. The foreign Promise is then the remaining owner.
             drainJobQueue();
             return {source, foreign};
           }
 
-          function dropOrdinarySourceRoots(source) {
+          function dropRoots(source) {
             source.eval(`
               liveObject = null;
+              module = null;
               instance = null;
               promising = null;
               suspending = null;
@@ -212,47 +169,43 @@ jobs:
             `);
           }
 
-          function sourceState(source) {
+          function state(source) {
             return JSON.parse(source.eval(`
-              var state = {
+              var snapshot = {
                 liveObject: weakLiveObject.deref() !== undefined,
                 instance: weakInstance.deref() !== undefined,
                 completionCount,
                 completion
               };
               clearKeptObjects();
-              JSON.stringify(state);
+              JSON.stringify(snapshot);
             `));
           }
 
-          // Control 1: a foreign-zone unresolved Promise must keep the source
-          // continuation, its Wasm instance and a live externref stack local alive.
+          // Positive ownership proof: after two source-zone collections, only
+          // the unresolved foreign Promise chain can retain the continuation.
           {
             let pair = setup("gc-only");
-            dropOrdinarySourceRoots(pair.source);
+            dropRoots(pair.source);
             gc(pair.source);
             gc(pair.source);
-            let before = sourceState(pair.source);
+            let before = state(pair.source);
             event("gc_only_before_settle", before);
             if (!before.liveObject || !before.instance || before.completionCount !== 0) {
-              fail("suspended continuation did not retain source state", before);
+              fail("continuation failed to retain source stack state", before);
             }
-
             pair.foreign.eval("settleForeign(17)");
             drainJobQueue();
-            let after = sourceState(pair.source);
+            let after = state(pair.source);
             event("gc_only_after_settle", after);
-            if (after.completionCount !== 1 ||
-                !after.completion ||
+            if (after.completionCount !== 1 || !after.completion ||
                 after.completion.kind !== "fulfilled" ||
                 after.completion.value !== 287454037) {
-              fail("cross-zone continuation resumed incorrectly", after);
+              fail("continuation resumed incorrectly", after);
             }
           }
 
-          // Control 2: the public JSPI constructors reject direct
-          // cross-compartment callable wrappers. This checks whether a foreign
-          // zone can directly own the ContObject reaction at all.
+          // Confirm direct cross-compartment JSPI wrappers are rejected.
           {
             let a = newGlobal({newCompartment: true});
             let b = newGlobal({newCompartment: true});
@@ -269,17 +222,16 @@ jobs:
             event("direct_foreign_suspending", {result});
           }
 
-          // Destructive case: observe the actual source-zone referents, discard
-          // normal roots, schedule only the source zone, nuke its CCWs, collect,
-          // and only then settle the still-live foreign Promise.
+          // Destructive source-realm teardown simulation. Observe the actual
+          // source objects, nuke the source CCWs, collect that scheduled zone,
+          // and settle the still-live foreign Promise afterwards.
           {
             let pair = setup("nuke-source");
             pair.source.eval(`
               addMarkObservers([weakLiveObject.deref(), weakInstance.deref()]);
               clearKeptObjects();
             `);
-            dropOrdinarySourceRoots(pair.source);
-
+            dropRoots(pair.source);
             schedulezone(pair.source);
             nukeCCW(pair.source);
             pair.source = null;
@@ -287,13 +239,12 @@ jobs:
             gc();
             let marks = getMarks();
             event("nuked_source_marks_before_settle", {marks});
-
             pair.foreign.eval("settleForeign(29)");
             drainJobQueue();
             event("nuked_source_settlement_drained", {marks});
           }
 
-          event("PASS", {message: "all diagnostics completed without sanitizer or invariant failure"});
+          event("PASS", {message: "no sanitizer or ownership failure"});
           EOF
 
           set +e
@@ -303,7 +254,7 @@ jobs:
           cat cross-zone.log
           echo "$rc" | tee cross-zone.rc
 
-      - name: Classify execution
+      - name: Classify
         shell: bash
         run: |
           rc=$(cat cross-zone.rc)
@@ -318,9 +269,8 @@ jobs:
           else
             echo "CLASSIFICATION=HARNESS_OR_UNKNOWN_FAILURE rc=$rc" | tee classification.txt
           fi
-          cat classification.txt
 
-      - name: Upload execution evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
