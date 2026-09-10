@@ -1,0 +1,111 @@
+name: JSPI cross-zone execution proof
+
+on:
+  push:
+    branches:
+      - security-shell-fetch-20260910
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shell:
+          - current
+          - historical
+        include:
+          - shell: current
+            artifact: current-asan-jsshell
+          - shell: historical
+            artifact: 2026-09-01-asan-jsshell
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download fetched shell artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: downloaded
+          github-token: ${{ github.token }}
+          repository: marcelhacks/indi
+          run-id: 34449710815
+
+      - name: Extract shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find downloaded -maxdepth 3 -type f -ls
+          ARCHIVE=$(find downloaded -type f -name '*.tar.gz' -print -quit)
+          test -n "$ARCHIVE"
+          mkdir shell
+          tar -xzf "$ARCHIVE" -C shell
+          find shell -maxdepth 6 -type f -ls
+          JS=$(find shell -type f -name js -perm -111 -print -quit)
+          test -n "$JS"
+          echo "JS=$JS" >> "$GITHUB_ENV"
+          echo "JS_DIR=$(dirname "$JS")" >> "$GITHUB_ENV"
+
+      - name: Record shell identity and JSPI options
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1
+        run: |
+          set -o pipefail
+          "$JS" --version 2>&1 | tee shell-version.txt
+          sha256sum "$JS" | tee shell-sha256.txt
+          "$JS" --help > shell-help.txt 2>&1 || true
+          grep -Ei 'jspi|promise.integration|stack.switch|stack-switch|wasm.*promise|wasm.*stack' shell-help.txt | tee shell-jspi-options.txt || true
+
+      - name: Probe shell APIs
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1
+          LD_LIBRARY_PATH: ${{ env.JS_DIR }}
+        run: |
+          cat > api-probe.js <<'EOF'
+          function val(name, thunk) {
+            try { return thunk(); } catch (e) { return "THREW:" + e; }
+          }
+          print("PROBE " + JSON.stringify({
+            suspending: typeof WebAssembly.Suspending,
+            promising: typeof WebAssembly.promising,
+            newGlobal: typeof newGlobal,
+            gc: typeof gc,
+            schedulezone: typeof schedulezone,
+            nukeCCW: typeof nukeCCW,
+            drainJobQueue: typeof drainJobQueue,
+            markObservers: typeof addMarkObservers,
+            jspiEnabled: val("jspi", () => typeof wasmJSPromiseIntegrationEnabled === "function" ? wasmJSPromiseIntegrationEnabled() : null),
+            stackSwitchingEnabled: val("stack", () => typeof wasmStackSwitchingEnabled === "function" ? wasmStackSwitchingEnabled() : null),
+            build: val("build", () => typeof getBuildConfiguration === "function" ? getBuildConfiguration() : null)
+          }));
+          EOF
+          set +e
+          timeout 60 "$JS" api-probe.js > api-probe.log 2>&1
+          rc=$?
+          set -e
+          cat api-probe.log
+          echo "$rc" > api-probe.rc
+          test "$rc" -eq 0
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jspi-api-probe-${{ matrix.shell }}
+          path: |
+            shell-version.txt
+            shell-sha256.txt
+            shell-help.txt
+            shell-jspi-options.txt
+            api-probe.log
+            api-probe.rc
+          if-no-files-found: warn
+          retention-days: 1
