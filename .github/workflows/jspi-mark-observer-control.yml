@@ -1,0 +1,126 @@
+name: JSPI source-zone collection control
+
+on:
+  push:
+    branches: [security-shell-fetch-20260910]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: current
+            artifact: current-asan-jsshell
+          - shell: historical
+            artifact: 2026-09-01-asan-jsshell
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: downloaded
+          github-token: ${{ github.token }}
+          repository: marcelhacks/indi
+          run-id: 34449710815
+
+      - name: Extract shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ARCHIVE=$(find downloaded -type f -name '*.tar.gz' -print -quit)
+          mkdir shell
+          tar -xzf "$ARCHIVE" -C shell
+          JS=$(find shell -type f -name js -perm -111 -print -quit)
+          test -n "$JS"
+          echo "JS=$JS" >> "$GITHUB_ENV"
+          echo "JS_DIR=$(dirname "$JS")" >> "$GITHUB_ENV"
+          "$JS" --version | tee shell-version.txt
+          sha256sum "$JS" | tee shell-sha256.txt
+
+      - name: Prove the collection oracle can report dead source objects
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:symbolize=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          LD_LIBRARY_PATH: ${{ env.JS_DIR }}
+        run: |
+          cat > mark-control.js <<'EOF'
+          "use strict";
+
+          function event(name, data = {}) {
+            print("CONTROL_EVENT " + JSON.stringify(Object.assign({name}, data)));
+          }
+
+          for (const name of [
+            "newGlobal", "schedulezone", "nukeCCW", "gc",
+            "addMarkObservers", "getMarks", "clearKeptObjects",
+            "wasmTextToBinary"
+          ]) {
+            if (typeof this[name] !== "function") {
+              event("SKIP", {api: name});
+              quit(77);
+            }
+          }
+
+          const bytes = JSON.stringify(Array.from(wasmTextToBinary(`(module
+            (func (export "f") (result i32) i32.const 1)
+          )`)));
+
+          let source = newGlobal({newCompartment: true});
+          source.eval(`
+            var unownedObject = {marker: 0x51515151};
+            var module = new WebAssembly.Module(new Uint8Array(${bytes}));
+            var unownedInstance = new WebAssembly.Instance(module);
+            addMarkObservers([unownedObject, unownedInstance]);
+            unownedObject = null;
+            unownedInstance = null;
+            module = null;
+            clearKeptObjects();
+          `);
+
+          schedulezone(source);
+          nukeCCW(source);
+          source = null;
+          clearKeptObjects();
+          gc();
+
+          const marks = getMarks();
+          event("marks", {marks});
+          if (marks.length !== 2 || marks[0] !== "dead" || marks[1] !== "dead") {
+            event("FAIL", {reason: "collection oracle did not collect unowned controls", marks});
+            quit(65);
+          }
+          event("PASS", {marks});
+          EOF
+
+          set +e
+          timeout 120 "$JS" mark-control.js > mark-control.log 2>&1
+          rc=$?
+          set -e
+          cat mark-control.log
+          echo "$rc" | tee mark-control.rc
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+
+      - name: Upload control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jspi-zone-collection-control-${{ matrix.shell }}
+          path: |
+            shell-version.txt
+            shell-sha256.txt
+            mark-control.js
+            mark-control.log
+            mark-control.rc
+          if-no-files-found: warn
+          retention-days: 1
