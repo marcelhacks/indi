@@ -9,21 +9,16 @@ permissions:
   contents: read
 
 jobs:
-  fetch:
+  current:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
-      - name: Install Mozilla fuzzfetch
-        run: python -m pip install --upgrade pip fuzzfetch
-
-      - name: Fetch current ASan fuzzing SpiderMonkey shell
+      - run: python -m pip install --upgrade pip fuzzfetch
+      - name: Fetch and package current ASan fuzzing shell
         shell: bash
         run: |
           set -euxo pipefail
@@ -36,12 +31,29 @@ jobs:
             --fuzzing \
             --name js \
             --out artifacts/current
-          find artifacts/current -maxdepth 2 -type f -ls
-          artifacts/current/js --version | tee artifacts/current/version.txt
-          sha256sum artifacts/current/js | tee artifacts/current/sha256.txt
+          find artifacts/current -maxdepth 5 -ls
+          JS=$(find artifacts/current -type f -name js -perm -111 -print -quit)
+          test -n "$JS"
+          "$JS" --version | tee artifacts/current/version.txt
+          sha256sum "$JS" | tee artifacts/current/sha256.txt
           tar -C artifacts -czf current-asan-jsshell.tar.gz current
+      - uses: actions/upload-artifact@v4
+        with:
+          name: current-asan-jsshell
+          path: current-asan-jsshell.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Fetch September 1 ASan fuzzing SpiderMonkey shell
+  historical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: python -m pip install --upgrade pip fuzzfetch
+      - name: Fetch and package September 1 ASan fuzzing shell
         shell: bash
         run: |
           set -euxo pipefail
@@ -55,17 +67,15 @@ jobs:
             --build 2026-09-01 \
             --name js \
             --out artifacts/2026-09-01
-          find artifacts/2026-09-01 -maxdepth 2 -type f -ls
-          artifacts/2026-09-01/js --version | tee artifacts/2026-09-01/version.txt
-          sha256sum artifacts/2026-09-01/js | tee artifacts/2026-09-01/sha256.txt
+          find artifacts/2026-09-01 -maxdepth 5 -ls
+          JS=$(find artifacts/2026-09-01 -type f -name js -perm -111 -print -quit)
+          test -n "$JS"
+          "$JS" --version | tee artifacts/2026-09-01/version.txt
+          sha256sum "$JS" | tee artifacts/2026-09-01/sha256.txt
           tar -C artifacts -czf 2026-09-01-asan-jsshell.tar.gz 2026-09-01
-
-      - name: Upload shells only
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: mozilla-spidermonkey-shells
-          path: |
-            current-asan-jsshell.tar.gz
-            2026-09-01-asan-jsshell.tar.gz
+          name: 2026-09-01-asan-jsshell
+          path: 2026-09-01-asan-jsshell.tar.gz
           if-no-files-found: error
           retention-days: 1
