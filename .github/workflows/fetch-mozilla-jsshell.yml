@@ -1,0 +1,71 @@
+name: Fetch Mozilla SpiderMonkey shells
+
+on:
+  push:
+    branches:
+      - security-shell-fetch-20260910
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Mozilla fuzzfetch
+        run: python -m pip install --upgrade pip fuzzfetch
+
+      - name: Fetch current ASan fuzzing SpiderMonkey shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/current
+          python -m fuzzfetch \
+            --target js \
+            --os Linux \
+            --cpu x86_64 \
+            --asan \
+            --fuzzing \
+            --name js \
+            --out artifacts/current
+          find artifacts/current -maxdepth 2 -type f -ls
+          artifacts/current/js --version | tee artifacts/current/version.txt
+          sha256sum artifacts/current/js | tee artifacts/current/sha256.txt
+          tar -C artifacts -czf current-asan-jsshell.tar.gz current
+
+      - name: Fetch September 1 ASan fuzzing SpiderMonkey shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/2026-09-01
+          python -m fuzzfetch \
+            --target js \
+            --os Linux \
+            --cpu x86_64 \
+            --asan \
+            --fuzzing \
+            --build 2026-09-01 \
+            --name js \
+            --out artifacts/2026-09-01
+          find artifacts/2026-09-01 -maxdepth 2 -type f -ls
+          artifacts/2026-09-01/js --version | tee artifacts/2026-09-01/version.txt
+          sha256sum artifacts/2026-09-01/js | tee artifacts/2026-09-01/sha256.txt
+          tar -C artifacts -czf 2026-09-01-asan-jsshell.tar.gz 2026-09-01
+
+      - name: Upload shells only
+        uses: actions/upload-artifact@v4
+        with:
+          name: mozilla-spidermonkey-shells
+          path: |
+            current-asan-jsshell.tar.gz
+            2026-09-01-asan-jsshell.tar.gz
+          if-no-files-found: error
+          retention-days: 1
