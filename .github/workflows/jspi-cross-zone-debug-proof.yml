@@ -1,0 +1,104 @@
+name: JSPI cross-zone debug proof
+
+on:
+  push:
+    branches: [security-shell-fetch-20260910]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  debug-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install fuzzfetch
+        run: python -m pip install --upgrade pip fuzzfetch
+
+      - name: Fetch current debug fuzzing shell
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p debug-shell
+          python -m fuzzfetch \
+            --target js \
+            --os Linux \
+            --cpu x86_64 \
+            --debug \
+            --fuzzing \
+            --name js \
+            --out debug-shell
+          JS=$(find debug-shell -type f -name js -perm -111 -print -quit)
+          test -n "$JS"
+          echo "JS=$JS" >> "$GITHUB_ENV"
+          echo "JS_DIR=$(dirname "$JS")" >> "$GITHUB_ENV"
+          "$JS" --version | tee debug-shell-version.txt
+          sha256sum "$JS" | tee debug-shell-sha256.txt
+
+      - name: Download validated proof script
+        uses: actions/download-artifact@v4
+        with:
+          name: jspi-cross-zone-proof-current
+          path: proof
+          github-token: ${{ github.token }}
+          repository: marcelhacks/indi
+          run-id: 34487978132
+
+      - name: Download collection control script
+        uses: actions/download-artifact@v4
+        with:
+          name: jspi-zone-collection-control-current
+          path: control
+          github-token: ${{ github.token }}
+          repository: marcelhacks/indi
+          run-id: 34488236419
+
+      - name: Execute both scripts under debug assertions
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ env.JS_DIR }}
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set +e
+          timeout 180 "$JS" proof/cross-zone.js > debug-proof.log 2>&1
+          proof_rc=$?
+          timeout 120 "$JS" control/mark-control.js > debug-control.log 2>&1
+          control_rc=$?
+          set -e
+          echo "$proof_rc" | tee debug-proof.rc
+          echo "$control_rc" | tee debug-control.rc
+          cat debug-proof.log
+          cat debug-control.log
+
+          if grep -Eqi 'MOZ_CRASH|Assertion failure|Segmentation fault|SEGV|UndefinedBehaviorSanitizer' debug-proof.log debug-control.log; then
+            echo 'CLASSIFICATION=DEBUG_FATAL_OR_SANITIZER_SIGNAL' | tee classification.txt
+          elif [ "$proof_rc" -eq 0 ] && [ "$control_rc" -eq 0 ] && \
+               grep -q 'P1_EVENT {"name":"PASS"' debug-proof.log && \
+               grep -q 'CONTROL_EVENT {"name":"PASS"' debug-control.log; then
+            echo 'CLASSIFICATION=NO_FAILURE_REPRODUCED' | tee classification.txt
+          else
+            echo "CLASSIFICATION=HARNESS_OR_INVARIANT_FAILURE proof_rc=$proof_rc control_rc=$control_rc" | tee classification.txt
+          fi
+
+      - name: Upload debug evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jspi-cross-zone-debug-proof
+          path: |
+            debug-shell-version.txt
+            debug-shell-sha256.txt
+            debug-proof.log
+            debug-proof.rc
+            debug-control.log
+            debug-control.rc
+            classification.txt
+            proof/cross-zone.js
+            control/mark-control.js
+          if-no-files-found: warn
+          retention-days: 1
